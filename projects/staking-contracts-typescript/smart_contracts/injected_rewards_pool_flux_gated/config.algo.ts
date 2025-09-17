@@ -10,18 +10,17 @@ export type mbrReturn = {
 };
 
 export const MAX_STAKERS_PER_POOL: uint64 = 500;
-export const ASSET_HOLDING_FEE: uint64 = 100000; // creation/holding fee for asset
 export const ALGORAND_ACCOUNT_MIN_BALANCE: uint64 = 100000;
-export const VERSION: uint64 = 3010;
-export const INITIAL_PAY_AMOUNT: uint64 = 10_000_000;
+export const VERSION: uint64 = 4000;
+export const INITIAL_PAY_AMOUNT: uint64 = 400_000;
 export const STANDARD_TXN_FEE: uint64 = 1_000;
 
-export class StakeInfo extends arc4.Struct<{
-  account: arc4.Address;
+export class StakeInfoRecord extends arc4.Struct<{
   stake: arc4.UintN64;
-  accruedASARewards: arc4.UintN64;
+  lastRewardIndex: arc4.UintN64;
+  // the number of asa rewards in the contract at the time of unstake or reward claiming by this user.
+  // Used to calculate their rewards versus the current total of rewards.
 }> {}
-
 
 export function mulDivW(a: uint64, b: uint64, c: uint64): uint64 {
   const [hi, lo] = mulw(a, b);
