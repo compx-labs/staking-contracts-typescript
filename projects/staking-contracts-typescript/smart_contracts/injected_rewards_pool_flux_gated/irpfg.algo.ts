@@ -1,58 +1,67 @@
-import { Account, arc4, assert, assertMatch, Asset, Box, Contract, ensureBudget, GlobalState, gtxn, itxn, op, uint64 } from '@algorandfoundation/algorand-typescript'
-import { Address, StaticArray, UintN64 } from '@algorandfoundation/algorand-typescript/arc4';
-import { AssetTransferTxn } from '@algorandfoundation/algorand-typescript/gtxn';
-import { Global, len } from '@algorandfoundation/algorand-typescript/op';
-import { StakeInfo } from './config.algo';
+import {
+  Account,
+  Application,
+  arc4,
+  assert,
+  assertMatch,
+  Asset,
+  Box,
+  contract,
+  Contract,
+  ensureBudget,
+  err,
+  GlobalState,
+  gtxn,
+  itxn,
+  op,
+  uint64,
+} from "@algorandfoundation/algorand-typescript";
+import { abiCall, abimethod, Address, StaticArray, UintN64, UintN8 } from "@algorandfoundation/algorand-typescript/arc4";
+import { Global } from "@algorandfoundation/algorand-typescript/op";
+import {
+  ALGORAND_ACCOUNT_MIN_BALANCE,
+  ASSET_HOLDING_FEE,
+  INITIAL_PAY_AMOUNT,
+  MAX_STAKERS_PER_POOL,
+  mbrReturn,
+  mulDivW,
+  PRECISION,
+  StakeInfo,
+  STANDARD_TXN_FEE,
+  VERSION,
+} from "./config.algo";
 
-const PRECISION = 1_000_000_000_000_000;
-
-
-
-// storage cost total bytes: 32+8+8 = 48
-
-export type mbrReturn = {
-  mbrPayment: uint64;
-};
-
-const MAX_STAKERS_PER_POOL = 650;
-const ASSET_HOLDING_FEE = 100000; // creation/holding fee for asset
-const ALGORAND_ACCOUNT_MIN_BALANCE = 100000;
-const VERSION = 3010;
-const INITIAL_PAY_AMOUNT = 400_000;
-const STANDARD_TXN_FEE: uint64 = 1_000;
-
-
+@contract({ name: "irpfg", avmVersion: 11 })
 export class InjectedRewardsPoolFluxGated extends Contract {
-  programVersion = 11;
-
   //Global State
 
-  stakers = Box<StaticArray<StakeInfo, typeof MAX_STAKERS_PER_POOL>>({ key: 'stakers' });
+  stakers = Box<StaticArray<StakeInfo, 650>>({ key: "stakers" });
 
-  staked_asset_id = GlobalState<UintN64>()
+  staked_asset_id = GlobalState<UintN64>();
 
-  reward_asset_id = GlobalState<UintN64>()
+  reward_asset_id = GlobalState<UintN64>();
 
-  total_staked = GlobalState<UintN64>()
+  total_staked = GlobalState<UintN64>();
 
-  injected_asa_rewards = GlobalState<UintN64>()
+  injected_asa_rewards = GlobalState<UintN64>();
 
-  last_reward_injection_time = GlobalState<UintN64>()
+  last_reward_injection_time = GlobalState<UintN64>();
 
-  last_accrual_time = GlobalState<UintN64>()
+  last_accrual_time = GlobalState<UintN64>();
 
-  admin_address = GlobalState<Account>()
+  admin_address = GlobalState<Account>();
 
-  minimum_balance = GlobalState<UintN64>()
+  minimum_balance = GlobalState<UintN64>();
 
-  num_stakers = GlobalState<UintN64>()
+  num_stakers = GlobalState<UintN64>();
 
-  contract_version = GlobalState<UintN64>()
+  contract_version = GlobalState<UintN64>();
 
-  flux_tier_required = GlobalState<UintN64>()
+  flux_tier_required = GlobalState<UintN8>();
 
-  flux_oracle_app_id = GlobalState<UintN64>()
+  flux_oracle_app = GlobalState<Application>();
 
+  @abimethod({ allowActions: "NoOp", onCreate: "require" })
   createApplication(adminAddress: Address): void {
     this.admin_address.value = adminAddress.native;
     this.contract_version.value = new UintN64(VERSION);
@@ -68,8 +77,15 @@ export class InjectedRewardsPoolFluxGated extends Contract {
    * @param rewardAssetId - The asset ID of the token to be distributed as rewards.
    * @param initialBalanceTxn - The payment transaction providing the initial minimum balance for the contract.
    */
-  initApplication(stakedAssetId: uint64, rewardAssetId: uint64, initialBalanceTxn: gtxn.PaymentTxn, fluxTierRequired: uint64, fluxOracleAppId: uint64): void {
-    assert(op.Txn.sender === this.admin_address.value, 'Only admin can init application');
+  @abimethod({ allowActions: "NoOp" })
+  initApplication(
+    stakedAssetId: uint64,
+    rewardAssetId: uint64,
+    initialBalanceTxn: gtxn.PaymentTxn,
+    fluxTierRequired: uint64,
+    fluxOracleApp: Application
+  ): void {
+    assert(op.Txn.sender === this.admin_address.value, "Only admin can init application");
 
     this.staked_asset_id.value = new UintN64(stakedAssetId);
     this.reward_asset_id.value = new UintN64(rewardAssetId);
@@ -77,49 +93,54 @@ export class InjectedRewardsPoolFluxGated extends Contract {
     this.last_reward_injection_time.value = new UintN64(0);
     this.injected_asa_rewards.value = new UintN64(0);
     this.num_stakers.value = new UintN64(0);
-    this.flux_tier_required.value = new UintN64(fluxTierRequired);
-    this.flux_oracle_app_id.value = new UintN64(fluxOracleAppId);
+    this.flux_tier_required.value = new UintN8(fluxTierRequired);
+    this.flux_oracle_app.value = fluxOracleApp
 
     assertMatch(initialBalanceTxn, {
       receiver: Global.currentApplicationAddress,
       amount: INITIAL_PAY_AMOUNT,
     });
 
-    itxn.assetTransfer({
-      xferAsset: stakedAssetId,
-      assetReceiver: Global.currentApplicationAddress,
-      assetAmount: 0,
-      fee: STANDARD_TXN_FEE,
-    });
-    if (rewardAssetId !== stakedAssetId) {
-      itxn.assetTransfer({
-        xferAsset: rewardAssetId,
+    itxn
+      .assetTransfer({
+        xferAsset: stakedAssetId,
         assetReceiver: Global.currentApplicationAddress,
         assetAmount: 0,
         fee: STANDARD_TXN_FEE,
-      });
+      })
+      .submit();
+    if (rewardAssetId !== stakedAssetId) {
+      itxn
+        .assetTransfer({
+          xferAsset: rewardAssetId,
+          assetReceiver: Global.currentApplicationAddress,
+          assetAmount: 0,
+          fee: STANDARD_TXN_FEE,
+        })
+        .submit();
     }
   }
   //ADMIN FUNCTIONS
-
+  @abimethod({ allowActions: "NoOp" })
   updateAdminAddress(adminAddress: Account): void {
-    assert(op.Txn.sender === this.admin_address.value, 'Only admin can update admin address');
+    assert(op.Txn.sender === this.admin_address.value, "Only admin can update admin address");
     this.admin_address.value = adminAddress;
   }
 
   private costForBoxStorage(totalNumBytes: uint64): uint64 {
-    const SCBOX_PERBOX = 2500;
-    const SCBOX_PERBYTE = 400;
+    const SCBOX_PERBOX: uint64 = 2500;
+    const SCBOX_PERBYTE: uint64 = 400;
 
     return SCBOX_PERBOX + totalNumBytes * SCBOX_PERBYTE;
   }
 
+  @abimethod({ allowActions: "NoOp" })
   getMBRForPoolCreation(): mbrReturn {
-    let nonAlgoRewardMBR = 0;
+    let nonAlgoRewardMBR: uint64 = 0;
     if (this.reward_asset_id.value.native !== 0) {
       nonAlgoRewardMBR += ASSET_HOLDING_FEE;
     }
-    const mbr =
+    const mbr: uint64 =
       ALGORAND_ACCOUNT_MIN_BALANCE +
       nonAlgoRewardMBR +
       this.costForBoxStorage(7 + 48 * MAX_STAKERS_PER_POOL) +
@@ -130,15 +151,16 @@ export class InjectedRewardsPoolFluxGated extends Contract {
     };
   }
 
+  @abimethod({ allowActions: "NoOp" })
   initStorage(mbrPayment: gtxn.PaymentTxn): void {
-    assert(!this.stakers.exists, 'staking pool already initialized');
-    assert(op.Txn.sender === this.admin_address.value, 'Only admin can init storage');
+    assert(!this.stakers.exists, "staking pool already initialized");
+    assert(op.Txn.sender === this.admin_address.value, "Only admin can init storage");
 
-    let nonAlgoRewardMBR = 0;
+    let nonAlgoRewardMBR: uint64 = 0;
     if (this.reward_asset_id.value.native !== 0) {
       nonAlgoRewardMBR += ASSET_HOLDING_FEE;
     }
-    const poolMBR =
+    const poolMBR: uint64 =
       ALGORAND_ACCOUNT_MIN_BALANCE +
       nonAlgoRewardMBR +
       this.costForBoxStorage(7 + 48 * MAX_STAKERS_PER_POOL) +
@@ -148,14 +170,13 @@ export class InjectedRewardsPoolFluxGated extends Contract {
     assertMatch(mbrPayment, { receiver: Global.currentApplicationAddress, amount: poolMBR });
     this.stakers.create();
     this.minimum_balance.value = new UintN64(poolMBR);
-
-
   }
   /*
    * Inject rewards into the pool
    */
-  injectRewards(rewardTxn: AssetTransferTxn, quantity: uint64, rewardAssetId: uint64): void {
-    assert(op.Txn.sender === this.admin_address.value, 'Only admin can inject rewards');
+  @abimethod({ allowActions: "NoOp" })
+  injectRewards(rewardTxn: gtxn.AssetTransferTxn, quantity: uint64, rewardAssetId: uint64): void {
+    assert(op.Txn.sender === this.admin_address.value, "Only admin can inject rewards");
 
     assertMatch(rewardTxn, {
       sender: this.admin_address.value,
@@ -167,30 +188,34 @@ export class InjectedRewardsPoolFluxGated extends Contract {
     this.last_reward_injection_time.value = new UintN64(Global.latestTimestamp);
   }
 
-  // need to udpate this
+  @abimethod({ allowActions: "DeleteApplication" })
   deleteApplication(): void {
-    assert(op.Txn.sender === this.admin_address.value, 'Only admin can delete application');
-    assert(this.total_staked.value.native === 0, 'Staked assets still exist');
+    assert(op.Txn.sender === this.admin_address.value, "Only admin can delete application");
+    assert(this.total_staked.value.native === 0, "Staked assets still exist");
 
     this.stakers.delete();
 
     // opt out of tokens
-    itxn.assetTransfer({
-      xferAsset: this.staked_asset_id.value.native,
-      assetCloseTo: Global.zeroAddress,
-      assetAmount: 0,
-      assetReceiver: Global.currentApplicationAddress,
-      fee: STANDARD_TXN_FEE,
-    });
-    // opt out of reward token
-    if (this.staked_asset_id.value !== this.reward_asset_id.value) {
-      itxn.assetTransfer({
-        xferAsset: this.reward_asset_id.value.native,
+    itxn
+      .assetTransfer({
+        xferAsset: this.staked_asset_id.value.native,
         assetCloseTo: Global.zeroAddress,
         assetAmount: 0,
         assetReceiver: Global.currentApplicationAddress,
         fee: STANDARD_TXN_FEE,
-      });
+      })
+      .submit();
+    // opt out of reward token
+    if (this.staked_asset_id.value !== this.reward_asset_id.value) {
+      itxn
+        .assetTransfer({
+          xferAsset: this.reward_asset_id.value.native,
+          assetCloseTo: Global.zeroAddress,
+          assetAmount: 0,
+          assetReceiver: Global.currentApplicationAddress,
+          fee: STANDARD_TXN_FEE,
+        })
+        .submit();
     }
 
     /* sendPayment({
@@ -200,21 +225,27 @@ export class InjectedRewardsPoolFluxGated extends Contract {
       fee: STANDARD_TXN_FEE,
     }); */
   }
-
-  stake(stakeTxn: AssetTransferTxn, quantity: uint64): void {
+  @abimethod({ allowActions: "NoOp" })
+  stake(stakeTxn: gtxn.AssetTransferTxn, quantity: uint64): void {
     const currentTimeStamp = Global.latestTimestamp;
-    assert(quantity > 0, 'Invalid quantity');
+    assert(quantity > 0, "Invalid quantity");
+
+   const oracle: Application = this.flux_oracle_app.value
+    const address = oracle.address
+    const contractAppId = oracle.id
 
     // Check users flux tier against oracle contract
-   /*  const tierResult = sendMethodCall<[Address], uint64>({
-      name: 'getUserTier',
+    const result = abiCall(FluxGateStub.prototype.getUserTier, {
+      appId: contractAppId,
+      args: [new arc4.Address(op.Txn.sender)],
       sender: Global.currentApplicationAddress,
-      fee:1000,
-      methodArgs: [new arc4.Address(this.txn.sender)]
-    });
+      fee: STANDARD_TXN_FEE,
+      apps: [oracle],
+      accounts: [op.Txn.sender],
+    }).returnValue;
 
-    assert(tierResult >= this.fluxTierRequired.value, 'Insufficient flux tier');
- */
+    assert(result.native >= this.flux_tier_required.value.native, "Insufficient flux tier");
+
     if (Global.opcodeBudget < 300) {
       ensureBudget(Global.opcodeBudget + 700);
     }
@@ -228,7 +259,7 @@ export class InjectedRewardsPoolFluxGated extends Contract {
     if (Global.opcodeBudget < 300) {
       ensureBudget(Global.opcodeBudget + 700);
     }
-    for (let i = 0; i < this.stakers.value.length; i += 1) {
+    for (let i: uint64 = 0; i < this.stakers.value.length; i += 1) {
       if (actionComplete) break;
 
       if (this.stakers.value[i].account === new arc4.Address(op.Txn.sender)) {
@@ -238,12 +269,12 @@ export class InjectedRewardsPoolFluxGated extends Contract {
         }
 
         const staker = this.stakers.value[i].copy();
-        staker.stake  = new UintN64(staker.stake.native + stakeTxn.assetAmount);
+        staker.stake = new UintN64(staker.stake.native + stakeTxn.assetAmount);
 
         if (Global.opcodeBudget < 300) {
           ensureBudget(Global.opcodeBudget + 700);
         }
-        this.stakers.value[i] = staker;
+        this.stakers.value[i] = staker.copy();
         this.total_staked.value = new UintN64(this.total_staked.value.native + stakeTxn.assetAmount);
         actionComplete = true;
       } else if (this.stakers.value[i].account === new arc4.Address(Global.zeroAddress)) {
@@ -267,21 +298,22 @@ export class InjectedRewardsPoolFluxGated extends Contract {
         actionComplete = true;
       } else {
         // pool is full return assert
-        assert(this.num_stakers.value.native < MAX_STAKERS_PER_POOL, 'Max stakers limit reached');
+        assert(this.num_stakers.value.native < MAX_STAKERS_PER_POOL, "Max stakers limit reached");
       }
 
       if (Global.opcodeBudget < 300) {
         ensureBudget(Global.opcodeBudget + 700);
       }
     }
-    assert(actionComplete, 'Stake  failed');
+    assert(actionComplete, "Stake  failed");
   }
 
+  @abimethod({ allowActions: "NoOp" })
   accrueRewards(): void {
     if (this.injected_asa_rewards.value.native * 2 > this.num_stakers.value.native) {
       const additionalASARewards = this.injected_asa_rewards.value;
 
-      for (let i = 0; i < this.num_stakers.value.native; i += 1) {
+      for (let i: uint64 = 0; i < this.num_stakers.value.native; i += 1) {
         if (Global.opcodeBudget < 300) {
           ensureBudget(Global.opcodeBudget + 700);
         }
@@ -289,42 +321,46 @@ export class InjectedRewardsPoolFluxGated extends Contract {
         if (this.stakers.value[i].stake.native > 0) {
           const staker = this.stakers.value[i].copy();
 
-          let stakerShare = wideRatio([staker.stake, PRECISION], [this.total_staked.value]);
+          //let stakerShare = wideRatio([staker.stake, PRECISION], [this.total_staked.value]);
+          let stakerShare = mulDivW(staker.stake.native, PRECISION, this.total_staked.value.native);
 
           if (Global.opcodeBudget < 300) {
             ensureBudget(Global.opcodeBudget + 700);
           }
 
           if (additionalASARewards.native > 0) {
-            let rewardRate = wideRatio([additionalASARewards, stakerShare], [PRECISION]);
+            //let rewardRate = wideRatio([additionalASARewards, stakerShare], [PRECISION]);
+            let rewardRate = mulDivW(additionalASARewards.native, stakerShare, PRECISION);
             if (rewardRate === 0) {
               rewardRate = 1;
             }
 
-            if (this.injected_asa_rewards.value >= rewardRate) {
+            if (this.injected_asa_rewards.value.native >= rewardRate) {
               this.injected_asa_rewards.value = new UintN64(this.injected_asa_rewards.value.native - rewardRate);
 
               if (this.reward_asset_id.value === this.staked_asset_id.value) {
                 //Compound rewards
-                staker.stake = staker.stake + rewardRate;
+                staker.stake = new UintN64(staker.stake.native + rewardRate);
                 this.total_staked.value = new UintN64(this.total_staked.value.native + rewardRate);
               } else {
-                staker.accruedASARewards = staker.accruedASARewards + rewardRate;
+                staker.accruedASARewards = new UintN64(staker.accruedASARewards.native + rewardRate);
               }
             } else {
               // For the edge case where the reward rate is > remaining rewards. We accrue the remainder to the user
               if (this.reward_asset_id.value === this.staked_asset_id.value) {
                 //Compound rewards
                 const diff: uint64 = rewardRate - this.injected_asa_rewards.value.native;
-                staker.stake = staker.stake + new UintN64(diff);
-                this.total_staked.value = new UintN64(this.total_staked.value.native + (rewardRate - this.injected_asa_rewards.value.native));
+                staker.stake = new UintN64(staker.stake.native + diff);
+                this.total_staked.value = new UintN64(
+                  this.total_staked.value.native + (rewardRate - this.injected_asa_rewards.value.native)
+                );
               } else {
-                staker.accruedASARewards = staker.accruedASARewards + new UintN64(rewardRate);
+                staker.accruedASARewards = new UintN64(staker.accruedASARewards.native + rewardRate);
               }
               this.injected_asa_rewards.value = new UintN64(0);
             }
 
-            this.stakers.value[i] = staker;
+            this.stakers.value[i] = staker.copy();
           }
         }
       }
@@ -333,7 +369,7 @@ export class InjectedRewardsPoolFluxGated extends Contract {
   }
 
   private getStaker(address: Address): StakeInfo {
-    for (let i = 0; i < this.num_stakers.value.native; i += 1) {
+    for (let i: uint64 = 0; i < this.num_stakers.value.native; i += 1) {
       if (Global.opcodeBudget < 300) {
         ensureBudget(Global.opcodeBudget + 700);
       }
@@ -347,91 +383,99 @@ export class InjectedRewardsPoolFluxGated extends Contract {
       accruedASARewards: new UintN64(0),
     }).copy();
   }
-
+  @abimethod({ allowActions: "NoOp" })
   claimRewards(): void {
     const staker = this.getStaker(new arc4.Address(op.Txn.sender));
 
     if (staker.accruedASARewards.native > 0) {
-      itxn.assetTransfer({
-        xferAsset: this.reward_asset_id.value.native,
-        assetReceiver: op.Txn.sender,
-        sender: Global.currentApplicationAddress,
-        assetAmount: staker.accruedASARewards.native,
-        fee: STANDARD_TXN_FEE,
-      });
+      itxn
+        .assetTransfer({
+          xferAsset: this.reward_asset_id.value.native,
+          assetReceiver: op.Txn.sender,
+          sender: Global.currentApplicationAddress,
+          assetAmount: staker.accruedASARewards.native,
+          fee: STANDARD_TXN_FEE,
+        })
+        .submit();
       staker.accruedASARewards = new UintN64(0);
     }
     if (Global.opcodeBudget < 300) {
-      ensureBudget(Global.opcodeBudget + 700);;
+      ensureBudget(Global.opcodeBudget + 700);
     }
     this.setStaker(staker.account, staker);
   }
-
+  @abimethod({ allowActions: "NoOp" })
   unstake(quantity: uint64): void {
-    for (let i = 0; i < this.numStakers.value; i += 1) {
+    for (let i: uint64 = 0; i < this.num_stakers.value.native; i += 1) {
       if (Global.opcodeBudget < 300) {
-        ensureBudget(Global.opcodeBudget + 700);;
+        ensureBudget(Global.opcodeBudget + 700);
       }
-      const staker = clone(this.stakers.value[i]);
-      if (staker.account === this.txn.sender) {
-        if (staker.stake > 0) {
-          assert(staker.stake >= quantity);
-          if (this.stakedAssetId.value === 0) {
-            sendPayment({
-              amount: quantity === 0 ? staker.stake : quantity,
-              receiver: this.txn.sender,
-              sender: this.app.address,
-              fee: 0,
-            });
+      const staker = this.stakers.value[i].copy();
+      if (staker.account === new arc4.Address(op.Txn.sender)) {
+        if (staker.stake.native > 0) {
+          assert(staker.stake.native >= quantity);
+          if (this.staked_asset_id.value.native === 0) {
+            itxn
+              .payment({
+                amount: quantity === 0 ? staker.stake.native : quantity,
+                receiver: op.Txn.sender,
+                sender: Global.currentApplicationAddress,
+                fee: 0,
+              })
+              .submit();
           } else {
-            sendAssetTransfer({
-              xferAsset: AssetID.fromUint64(this.stakedAssetId.value),
-              assetReceiver: this.txn.sender,
-              sender: this.app.address,
-              assetAmount: quantity === 0 ? staker.stake : quantity,
-              fee: STANDARD_TXN_FEE,
-            });
+            itxn
+              .assetTransfer({
+                xferAsset: this.staked_asset_id.value.native,
+                assetReceiver: op.Txn.sender,
+                sender: Global.currentApplicationAddress,
+                assetAmount: quantity === 0 ? staker.stake.native : quantity,
+                fee: STANDARD_TXN_FEE,
+              })
+              .submit();
           }
         }
         //check other rewards
-        if (staker.accruedASARewards > 0) {
-          sendAssetTransfer({
-            xferAsset: AssetID.fromUint64(this.rewardAssetId.value),
-            assetReceiver: this.txn.sender,
-            sender: this.app.address,
-            assetAmount: staker.accruedASARewards,
-            fee: STANDARD_TXN_FEE,
-          });
-          staker.accruedASARewards = 0;
+        if (staker.accruedASARewards.native > 0) {
+          itxn
+            .assetTransfer({
+              xferAsset: this.reward_asset_id.value.native,
+              assetReceiver: op.Txn.sender,
+              sender: Global.currentApplicationAddress,
+              assetAmount: staker.accruedASARewards.native,
+              fee: STANDARD_TXN_FEE,
+            })
+            .submit();
+          staker.accruedASARewards = new UintN64(0);
         }
 
         // Update the total staked value
-        this.totalStaked.value = this.totalStaked.value - (quantity === 0 ? staker.stake : quantity);
+        this.total_staked.value = new UintN64(this.total_staked.value.native - (quantity === 0 ? staker.stake.native : quantity));
 
         if (Global.opcodeBudget < 300) {
-          ensureBudget(Global.opcodeBudget + 700);;
+          ensureBudget(Global.opcodeBudget + 700);
         }
 
         if (quantity === 0) {
-          const removedStaker: StakeInfo = {
-            account: Global.zeroAddress,
-            stake: 0,
-            accruedASARewards: 0,
-          };
+          const removedStaker = new StakeInfo({
+            account: new arc4.Address(Global.zeroAddress),
+            stake: new UintN64(0),
+            accruedASARewards: new UintN64(0),
+          }).copy();
           this.setStaker(staker.account, removedStaker);
           //copy last staker to the removed staker position
-          const lastStaker = this.getStaker(this.stakers.value[this.numStakers.value - 1].account);
-          const lastStakerIndex = this.getStakerIndex(this.stakers.value[this.numStakers.value - 1].account);
+          const lastStaker = this.getStaker(this.stakers.value[this.num_stakers.value.native - 1].account);
+          const lastStakerIndex = this.getStakerIndex(this.stakers.value[this.num_stakers.value.native - 1].account);
           if (Global.opcodeBudget < 300) {
-            ensureBudget(Global.opcodeBudget + 700);;
+            ensureBudget(Global.opcodeBudget + 700);
           }
           this.setStakerAtIndex(lastStaker, i);
           //remove old record of last staker
           this.setStakerAtIndex(removedStaker, lastStakerIndex);
-          this.numStakers.value = this.numStakers.value - 1;
+          this.num_stakers.value = new UintN64(this.num_stakers.value.native - 1);
         } else {
-          staker.stake = staker.stake - quantity;
-          staker.accruedASARewards = 0;
+          staker.stake = new UintN64(staker.stake.native - quantity);
+          staker.accruedASARewards = new UintN64(0);
         }
         this.setStaker(staker.account, staker);
       }
@@ -439,10 +483,7 @@ export class InjectedRewardsPoolFluxGated extends Contract {
   }
 
   private getStakerIndex(address: Address): uint64 {
-    for (let i = 0; i < this.numStakers.value; i += 1) {
-      if (Global.opcodeBudget < 300) {
-        ensureBudget(Global.opcodeBudget + 700);;
-      }
+    for (let i: uint64 = 0; i < this.num_stakers.value.native; i += 1) {
       if (this.stakers.value[i].account === address) {
         return i;
       }
@@ -451,22 +492,28 @@ export class InjectedRewardsPoolFluxGated extends Contract {
   }
 
   private setStaker(stakerAccount: Address, staker: StakeInfo): void {
-    for (let i = 0; i < this.numStakers.value; i += 1) {
+    for (let i: uint64 = 0; i < this.num_stakers.value.native; i += 1) {
       if (Global.opcodeBudget < 300) {
-        ensureBudget(Global.opcodeBudget + 700);;
+        ensureBudget(Global.opcodeBudget + 700);
       }
       if (this.stakers.value[i].account === stakerAccount) {
-        this.stakers.value[i] = staker;
+        this.stakers.value[i] = staker.copy();
         return;
-      } else if (this.stakers.value[i].account === Global.zeroAddress) {
-        this.stakers.value[i] = staker;
+      } else if (this.stakers.value[i].account === new arc4.Address(Global.zeroAddress)) {
+        this.stakers.value[i] = staker.copy();
         return;
       }
     }
   }
   private setStakerAtIndex(staker: StakeInfo, index: uint64): void {
-    this.stakers.value[index] = staker;
+    this.stakers.value[index] = staker.copy();
   }
 
   gas(): void {}
+}
+export abstract class FluxGateStub extends Contract {
+  @abimethod({ allowActions: "NoOp" })
+  getUserTier(user: arc4.Address): UintN64 {
+    err("stub only");
+  }
 }
