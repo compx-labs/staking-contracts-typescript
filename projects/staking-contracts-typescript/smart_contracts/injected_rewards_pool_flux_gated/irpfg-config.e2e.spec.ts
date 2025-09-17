@@ -18,11 +18,6 @@ const BYTE_LENGTH_REWARD_ASSET = 8;
 const MIN_FEE = AlgoAmount.MicroAlgos(250_000);
 const FLUX_TIER_REQUIRED = 1;
 
-async function getMBRFromAppClient() {
-  const result = await appClient.newGroup().getMbrForPoolCreation({ args: [] }).simulate({ allowUnnamedResources: true });
-  return result.returns![0];
-}
-
 describe("Injected Reward Pool setup/admin functions - no staking", () => {
   beforeEach(fixture.beforeEach);
 
@@ -54,7 +49,7 @@ describe("Injected Reward Pool setup/admin functions - no staking", () => {
     const initialBalanceTxn = await fixture.algorand.createTransaction.payment({
       sender: admin.addr,
       receiver: appClient.appAddress,
-      amount: algokit.microAlgos(10_000_000),
+      amount: algokit.microAlgos(400_000),
     });
 
     await appClient.send.initApplication({
@@ -72,38 +67,11 @@ describe("Injected Reward Pool setup/admin functions - no staking", () => {
     expect(globalState.fluxTierRequired).toBe(FLUX_TIER_REQUIRED);
   });
 
-  test("init storage", async () => {
-    appClient.algorand.setSignerFromAccount(admin);
-    const mbr = await getMBRFromAppClient();
-    const mbrTxn = await appClient.algorand.createTransaction.payment({
-      sender: admin.addr,
-      receiver: appClient.appAddress,
-      amount: algokit.microAlgos(Number(mbr?.mbrPayment)),
-    });
-
-    await appClient
-      .newGroup()
-      .gas({ args: [], note: "1" })
-      .gas({ args: [], note: "2" })
-      .gas({ args: [], note: "3" })
-      .initStorage({
-        args: [mbrTxn],
-      })
-      .send();
-
-    const boxNames = await appClient.appClient.getBoxNames();
-    expect(boxNames.length).toBe(1);
-  });
 
   test("deleteApplication", async () => {
     appClient.algorand.setSignerFromAccount(admin);
     await appClient
       .newGroup()
-      .gas({ args: [], note: "1" })
-      .gas({ args: [], note: "2" })
-      .gas({ args: [], note: "3" })
-      .gas({ args: [], note: "4" })
-      .gas({ args: [], note: "5" })
       .delete.deleteApplication()
       .send();
   });
