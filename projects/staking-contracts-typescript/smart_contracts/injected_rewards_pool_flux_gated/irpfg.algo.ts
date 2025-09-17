@@ -17,7 +17,7 @@ import {
 } from "@algorandfoundation/algorand-typescript";
 import { abiCall, abimethod, Address, UintN64, UintN8 } from "@algorandfoundation/algorand-typescript/arc4";
 import { Global } from "@algorandfoundation/algorand-typescript/op";
-import { INITIAL_PAY_AMOUNT, mulDivW, PRECISION, StakeInfoRecord, STANDARD_TXN_FEE, VERSION } from "./config.algo";
+import { BOX_FEE, INITIAL_PAY_AMOUNT, mulDivW, PRECISION, StakeInfoRecord, STANDARD_TXN_FEE, VERSION } from "./config.algo";
 
 @contract({ name: "irpfg", avmVersion: 11 })
 export class InjectedRewardsPoolFluxGated extends Contract {
@@ -158,7 +158,7 @@ export class InjectedRewardsPoolFluxGated extends Contract {
   }
 
   @abimethod({ allowActions: "NoOp" })
-  stake(stakeTxn: gtxn.AssetTransferTxn, quantity: uint64): void {
+  stake(stakeTxn: gtxn.AssetTransferTxn, quantity: uint64, mbrTxn: gtxn.PaymentTxn): void {
     assert(quantity > 0, "Invalid quantity");
 
     assertMatch(stakeTxn, {
@@ -166,6 +166,12 @@ export class InjectedRewardsPoolFluxGated extends Contract {
       assetReceiver: Global.currentApplicationAddress,
       xferAsset: Asset(this.staked_asset_id.value.native),
       assetAmount: quantity,
+    });
+
+    assertMatch(mbrTxn, {
+      sender: op.Txn.sender,
+      receiver: Global.currentApplicationAddress,
+      amount: BOX_FEE,
     });
 
     const oracle: Application = this.flux_oracle_app.value;
@@ -187,12 +193,27 @@ export class InjectedRewardsPoolFluxGated extends Contract {
     const hasLoan = this.stakers(op.Txn.sender).exists;
 
     if (hasLoan) {
-      const newStake = new UintN64(this.stakers(op.Txn.sender).value.stake.native + stakeTxn.assetAmount);
-      this.stakers(op.Txn.sender).value = new StakeInfoRecord({
-        stake: newStake,
-        lastRewardIndex: this.stakers(op.Txn.sender).value.lastRewardIndex,
-      }).copy();
-      this.total_staked.value = new UintN64(this.total_staked.value.native + stakeTxn.assetAmount);
+      if (this.staked_asset_id.value === this.reward_asset_id.value) {
+        //Compounding stake and rewards
+        const rewardIndexDiff: uint64 =
+          this.current_asa_reward_index.value.native - this.stakers(op.Txn.sender).value.lastRewardIndex.native;
+        let shareOfTotalStake = mulDivW(this.stakers(op.Txn.sender).value.stake.native, PRECISION, this.total_staked.value.native);
+        let shareOfRewards = mulDivW(rewardIndexDiff, shareOfTotalStake, PRECISION);
+        const newStake = new UintN64(this.stakers(op.Txn.sender).value.stake.native + stakeTxn.assetAmount + shareOfRewards);
+        this.stakers(op.Txn.sender).value = new StakeInfoRecord({
+          stake: newStake,
+          lastRewardIndex: this.current_asa_reward_index.value,
+        }).copy();
+        this.total_staked.value = new UintN64(this.total_staked.value.native + stakeTxn.assetAmount + shareOfRewards);
+      } else {
+        //Just adding to stake, rewards remain separate as not compoundable
+        const newStake = new UintN64(this.stakers(op.Txn.sender).value.stake.native + stakeTxn.assetAmount);
+        this.stakers(op.Txn.sender).value = new StakeInfoRecord({
+          stake: newStake,
+          lastRewardIndex: this.stakers(op.Txn.sender).value.lastRewardIndex,
+        }).copy();
+        this.total_staked.value = new UintN64(this.total_staked.value.native + stakeTxn.assetAmount);
+      }
     } else {
       this.stakers(op.Txn.sender).value = new StakeInfoRecord({
         stake: new UintN64(stakeTxn.assetAmount),
@@ -218,6 +239,9 @@ export class InjectedRewardsPoolFluxGated extends Contract {
     let shareOfRewards = mulDivW(rewardIndexDiff, shareOfTotalStake, PRECISION);
 
     if (shareOfRewards > 0) {
+      // Update current reward index to reflect claimed rewards
+      this.current_asa_reward_index.value = new UintN64(this.current_asa_reward_index.value.native - shareOfRewards);
+      // Send rewards to user
       itxn
         .assetTransfer({
           xferAsset: this.reward_asset_id.value.native,
@@ -242,17 +266,9 @@ export class InjectedRewardsPoolFluxGated extends Contract {
 
     assert(currentRecord.stake.native >= quantity);
 
-    itxn
-      .assetTransfer({
-        xferAsset: this.staked_asset_id.value.native,
-        assetReceiver: op.Txn.sender,
-        sender: Global.currentApplicationAddress,
-        assetAmount: quantity === 0 ? currentRecord.stake.native : quantity,
-        fee: STANDARD_TXN_FEE,
-      })
-      .submit();
+    let shareOfRewards: uint64 = 0;
 
-    //check other rewards
+    //Apply rewards
     if (currentRecord.lastRewardIndex !== this.current_asa_reward_index.value) {
       //Check for rewards to be claimed
       const rewardIndexDiff: uint64 = this.current_asa_reward_index.value.native - currentRecord.lastRewardIndex.native;
@@ -260,26 +276,49 @@ export class InjectedRewardsPoolFluxGated extends Contract {
       let shareOfRewards = mulDivW(rewardIndexDiff, shareOfTotalStake, PRECISION);
 
       if (shareOfRewards > 0) {
-        itxn
-          .assetTransfer({
-            xferAsset: this.reward_asset_id.value.native,
-            assetReceiver: op.Txn.sender,
-            sender: Global.currentApplicationAddress,
-            assetAmount: shareOfRewards,
-            fee: STANDARD_TXN_FEE,
-          })
-          .submit();
+        this.current_asa_reward_index.value = new UintN64(this.current_asa_reward_index.value.native - shareOfRewards);
+
+        if (this.staked_asset_id.value === this.reward_asset_id.value) {
+          //Compound rewards into stake if same asset
+          this.stakers(op.Txn.sender).value = new StakeInfoRecord({
+            stake: new UintN64(currentRecord.stake.native + shareOfRewards),
+            lastRewardIndex: this.current_asa_reward_index.value,
+          }).copy();
+          this.total_staked.value = new UintN64(this.total_staked.value.native + shareOfRewards);
+        } else {
+          itxn
+            .assetTransfer({
+              xferAsset: this.reward_asset_id.value.native,
+              assetReceiver: op.Txn.sender,
+              sender: Global.currentApplicationAddress,
+              assetAmount: shareOfRewards,
+              fee: STANDARD_TXN_FEE,
+            })
+            .submit();
+        }
       }
     }
 
+    const updatedRecord = this.stakers(op.Txn.sender).value.copy();
+    itxn
+      .assetTransfer({
+        xferAsset: this.staked_asset_id.value.native,
+        assetReceiver: op.Txn.sender,
+        sender: Global.currentApplicationAddress,
+        assetAmount: quantity === 0 ? updatedRecord.stake.native : quantity,
+        fee: STANDARD_TXN_FEE,
+      })
+      .submit();
+
     // Update the total staked value
-    this.total_staked.value = new UintN64(this.total_staked.value.native - (quantity === 0 ? currentRecord.stake.native : quantity));
+    // Not using the stakeToRemove vairable here, as totalStake wont have been updated from compounded rewards.
+    this.total_staked.value = new UintN64(this.total_staked.value.native - (quantity === 0 ? updatedRecord.stake.native : quantity));
     if (quantity === 0) {
       this.stakers(op.Txn.sender).delete();
       this.num_stakers.value = new UintN64(this.num_stakers.value.native - 1);
     } else {
       this.stakers(op.Txn.sender).value = new StakeInfoRecord({
-        stake: new UintN64(currentRecord.stake.native - quantity),
+        stake: new UintN64(updatedRecord.stake.native - quantity),
         lastRewardIndex: this.current_asa_reward_index.value,
       }).copy();
     }

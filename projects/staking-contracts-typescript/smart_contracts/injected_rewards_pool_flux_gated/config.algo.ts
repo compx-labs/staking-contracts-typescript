@@ -14,6 +14,7 @@ export const ALGORAND_ACCOUNT_MIN_BALANCE: uint64 = 100000;
 export const VERSION: uint64 = 4000;
 export const INITIAL_PAY_AMOUNT: uint64 = 400_000;
 export const STANDARD_TXN_FEE: uint64 = 1_000;
+export const BOX_FEE: uint64 = 22_500;
 
 export class StakeInfoRecord extends arc4.Struct<{
   stake: arc4.UintN64;
