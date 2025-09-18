@@ -111,6 +111,17 @@ export class InjectedRewardsPoolFluxGated extends Contract {
     this.admin_address.value = adminAddress;
   }
 
+  @abimethod({ allowActions: "NoOp" })
+  updateFluxOracle(fluxOracleApp: Application): void {
+    assert(op.Txn.sender === this.admin_address.value, "Only admin can update flux oracle");
+    this.flux_oracle_app.value = fluxOracleApp;
+  }
+  @abimethod({ allowActions: "NoOp" })
+  updateFluxTierRequired(fluxTierRequired: uint64): void {
+    assert(op.Txn.sender === this.admin_address.value, "Only admin can update flux tier");
+    this.flux_tier_required.value = new UintN8(fluxTierRequired);
+  }
+
   /*
    * Inject rewards into the pool
    */
