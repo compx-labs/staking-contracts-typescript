@@ -31,7 +31,7 @@ export class InjectedRewardsPoolFluxGated extends Contract {
 
   total_staked = GlobalState<UintN64>();
   // lifetime tracking
-  current_asa_reward_index = GlobalState<UintN64>();
+  reward_per_token = GlobalState<UintN64>();
 
   last_reward_injection_time = GlobalState<UintN64>();
 
@@ -75,7 +75,7 @@ export class InjectedRewardsPoolFluxGated extends Contract {
     this.reward_asset_id.value = new UintN64(rewardAssetId);
     this.total_staked.value = new UintN64(0);
     this.last_reward_injection_time.value = new UintN64(0);
-    this.current_asa_reward_index.value = new UintN64(0);
+    this.reward_per_token.value = new UintN64(0);
     this.num_stakers.value = new UintN64(0);
     this.flux_tier_required.value = new UintN8(fluxTierRequired);
     this.flux_oracle_app.value = fluxOracleApp;
@@ -117,14 +117,19 @@ export class InjectedRewardsPoolFluxGated extends Contract {
   @abimethod({ allowActions: "NoOp" })
   injectRewards(rewardTxn: gtxn.AssetTransferTxn, quantity: uint64, rewardAssetId: uint64): void {
     assert(op.Txn.sender === this.admin_address.value, "Only admin can inject rewards");
+    assert(quantity > 0, "Invalid reward quantity");
+    assert(rewardAssetId === this.reward_asset_id.value.native, "Wrong reward asset");
 
     assertMatch(rewardTxn, {
       sender: this.admin_address.value,
       assetReceiver: Global.currentApplicationAddress,
-      xferAsset: Asset(rewardAssetId),
+      xferAsset: Asset(this.reward_asset_id.value.native),
       assetAmount: quantity,
     });
-    this.current_asa_reward_index.value = new UintN64(this.current_asa_reward_index.value.native + quantity);
+    assert(this.total_staked.value.native > 0, "No stakers");
+
+    const deltaRPT = mulDivW(quantity, PRECISION, this.total_staked.value.native);
+    this.reward_per_token.value = new UintN64(this.reward_per_token.value.native + deltaRPT);
     this.last_reward_injection_time.value = new UintN64(Global.latestTimestamp);
   }
 
@@ -137,7 +142,7 @@ export class InjectedRewardsPoolFluxGated extends Contract {
     itxn
       .assetTransfer({
         xferAsset: this.staked_asset_id.value.native,
-        assetCloseTo: Global.zeroAddress,
+        assetCloseTo: this.admin_address.value,
         assetAmount: 0,
         assetReceiver: Global.currentApplicationAddress,
         fee: STANDARD_TXN_FEE,
@@ -148,7 +153,7 @@ export class InjectedRewardsPoolFluxGated extends Contract {
       itxn
         .assetTransfer({
           xferAsset: this.reward_asset_id.value.native,
-          assetCloseTo: Global.zeroAddress,
+          assetCloseTo: this.admin_address.value,
           assetAmount: 0,
           assetReceiver: Global.currentApplicationAddress,
           fee: STANDARD_TXN_FEE,
@@ -168,158 +173,166 @@ export class InjectedRewardsPoolFluxGated extends Contract {
       assetAmount: quantity,
     });
 
-    assertMatch(mbrTxn, {
-      sender: op.Txn.sender,
-      receiver: Global.currentApplicationAddress,
-      amount: BOX_FEE,
-    });
-
     const oracle: Application = this.flux_oracle_app.value;
-    const address = oracle.address;
-    const contractAppId = oracle.id;
-
-    // Check users flux tier against oracle contract
     const result = abiCall(FluxGateStub.prototype.getUserTier, {
-      appId: contractAppId,
+      appId: oracle.id,
       args: [new arc4.Address(op.Txn.sender)],
       sender: Global.currentApplicationAddress,
       fee: STANDARD_TXN_FEE,
       apps: [oracle],
       accounts: [op.Txn.sender],
     }).returnValue;
-
     assert(result.native >= this.flux_tier_required.value.native, "Insufficient flux tier");
 
-    const hasLoan = this.stakers(op.Txn.sender).exists;
+    const exists = this.stakers(op.Txn.sender).exists;
+    if (!exists) {
+      assertMatch(mbrTxn, {
+        sender: op.Txn.sender,
+        receiver: Global.currentApplicationAddress,
+        amount: BOX_FEE,
+      });
+    }
 
-    if (hasLoan) {
-      if (this.staked_asset_id.value === this.reward_asset_id.value) {
-        //Compounding stake and rewards
-        const rewardIndexDiff: uint64 =
-          this.current_asa_reward_index.value.native - this.stakers(op.Txn.sender).value.lastRewardIndex.native;
-        let shareOfTotalStake = mulDivW(this.stakers(op.Txn.sender).value.stake.native, PRECISION, this.total_staked.value.native);
-        let shareOfRewards = mulDivW(rewardIndexDiff, shareOfTotalStake, PRECISION);
-        const newStake = new UintN64(this.stakers(op.Txn.sender).value.stake.native + stakeTxn.assetAmount + shareOfRewards);
-        this.stakers(op.Txn.sender).value = new StakeInfoRecord({
-          stake: newStake,
-          lastRewardIndex: this.current_asa_reward_index.value,
-        }).copy();
-        this.total_staked.value = new UintN64(this.total_staked.value.native + stakeTxn.assetAmount + shareOfRewards);
+    const prevStake: uint64 = exists ? this.stakers(op.Txn.sender).value.stake.native : 0;
+    const prevDebt: uint64 = exists ? this.stakers(op.Txn.sender).value.rewardDebt.native : 0;
+
+    // 5) Calculate pending rewards with monotonic RPT
+    //    pending = floor(prevStake * reward_per_token / PRECISION) - prevDebt
+    const accrued = mulDivW(prevStake, this.reward_per_token.value.native, PRECISION);
+    const pending: uint64 = accrued > prevDebt ? accrued - prevDebt : 0;
+
+    // 6) If pending > 0, either compound (if same asset) or pay out (if different)
+    let newStake: uint64 = prevStake;
+    if (pending > 0) {
+      if (this.staked_asset_id.value.native === this.reward_asset_id.value.native) {
+        // Compound: add pending rewards into stake and total_staked
+        newStake = newStake + pending;
+        this.total_staked.value = new UintN64(this.total_staked.value.native + pending);
       } else {
-        //Just adding to stake, rewards remain separate as not compoundable
-        const newStake = new UintN64(this.stakers(op.Txn.sender).value.stake.native + stakeTxn.assetAmount);
-        this.stakers(op.Txn.sender).value = new StakeInfoRecord({
-          stake: newStake,
-          lastRewardIndex: this.stakers(op.Txn.sender).value.lastRewardIndex,
-        }).copy();
-        this.total_staked.value = new UintN64(this.total_staked.value.native + stakeTxn.assetAmount);
+        itxn
+          .assetTransfer({
+            xferAsset: this.reward_asset_id.value.native,
+            assetReceiver: op.Txn.sender,
+            sender: Global.currentApplicationAddress,
+            assetAmount: pending,
+            fee: STANDARD_TXN_FEE,
+          })
+          .submit();
       }
-    } else {
-      this.stakers(op.Txn.sender).value = new StakeInfoRecord({
-        stake: new UintN64(stakeTxn.assetAmount),
-        lastRewardIndex: this.current_asa_reward_index.value,
-      }).copy();
+    }
 
+    // 7) Add the new deposit
+    newStake = newStake + quantity;
+    this.total_staked.value = new UintN64(this.total_staked.value.native + quantity);
+
+    // 8) Update user record (set rewardDebt to the new checkpoint)
+    const newDebt = mulDivW(newStake, this.reward_per_token.value.native, PRECISION);
+    this.stakers(op.Txn.sender).value = new StakeInfoRecord({
+      stake: new UintN64(newStake),
+      rewardDebt: new UintN64(newDebt),
+    }).copy();
+
+    if (!exists) {
       this.num_stakers.value = new UintN64(this.num_stakers.value.native + 1);
-      this.total_staked.value = new UintN64(this.total_staked.value.native + stakeTxn.assetAmount);
     }
   }
 
   @abimethod({ allowActions: "NoOp" })
   claimRewards(): void {
+    // Must have a stake record
     assert(this.stakers(op.Txn.sender).exists, "No stake found for user");
+    assert(this.staked_asset_id.value.native !== this.reward_asset_id.value.native, "Cannot claim rewards that compound");
 
     const staker = this.stakers(op.Txn.sender).value.copy();
-
     assert(staker.stake.native > 0, "No stake");
 
-    // Calculate rewards base on user reward index and current reward index diff
-    const rewardIndexDiff: uint64 = this.current_asa_reward_index.value.native - staker.lastRewardIndex.native;
-    let shareOfTotalStake = mulDivW(staker.stake.native, PRECISION, this.total_staked.value.native);
-    let shareOfRewards = mulDivW(rewardIndexDiff, shareOfTotalStake, PRECISION);
+    // pending = floor(stake * reward_per_token / PRECISION) - rewardDebt
+    const accrued = mulDivW(staker.stake.native, this.reward_per_token.value.native, PRECISION);
+    const pending: uint64 = accrued > staker.rewardDebt.native ? accrued - staker.rewardDebt.native : 0;
 
-    if (shareOfRewards > 0) {
-      // Update current reward index to reflect claimed rewards
-      this.current_asa_reward_index.value = new UintN64(this.current_asa_reward_index.value.native - shareOfRewards);
-      // Send rewards to user
+    if (pending > 0) {
       itxn
         .assetTransfer({
           xferAsset: this.reward_asset_id.value.native,
           assetReceiver: op.Txn.sender,
           sender: Global.currentApplicationAddress,
-          assetAmount: shareOfRewards,
+          assetAmount: pending,
           fee: STANDARD_TXN_FEE,
         })
         .submit();
     }
+
+    const newDebt = mulDivW(staker.stake.native, this.reward_per_token.value.native, PRECISION);
     this.stakers(op.Txn.sender).value = new StakeInfoRecord({
       stake: staker.stake,
-      lastRewardIndex: this.current_asa_reward_index.value,
+      rewardDebt: new UintN64(newDebt),
     }).copy();
   }
 
   @abimethod({ allowActions: "NoOp" })
   unstake(quantity: uint64): void {
+    // 0) Must be an active staker
     assert(this.stakers(op.Txn.sender).exists, "No stake found for user");
-    const currentRecord = this.stakers(op.Txn.sender).value.copy();
-    assert(currentRecord.stake.native > 0, "No stake");
+    const rec = this.stakers(op.Txn.sender).value.copy();
+    const stakeNow: uint64 = rec.stake.native;
+    assert(stakeNow > 0, "No stake");
 
-    assert(currentRecord.stake.native >= quantity);
+    const amountToWithdraw: uint64 = quantity === 0 ? stakeNow : quantity;
+    assert(stakeNow >= amountToWithdraw, "Unstake amount exceeds balance");
 
-    let shareOfRewards: uint64 = 0;
+    // 2) Settle pending rewards using monotonic accumulator
+    //    pending = floor(stake * reward_per_token / PRECISION) - rewardDebt
+    const accrued = mulDivW(stakeNow, this.reward_per_token.value.native, PRECISION);
+    const pending: uint64 = accrued > rec.rewardDebt.native ? accrued - rec.rewardDebt.native : 0;
 
-    //Apply rewards
-    if (currentRecord.lastRewardIndex !== this.current_asa_reward_index.value) {
-      //Check for rewards to be claimed
-      const rewardIndexDiff: uint64 = this.current_asa_reward_index.value.native - currentRecord.lastRewardIndex.native;
-      let shareOfTotalStake = mulDivW(currentRecord.stake.native, PRECISION, this.total_staked.value.native);
-      let shareOfRewards = mulDivW(rewardIndexDiff, shareOfTotalStake, PRECISION);
-
-      if (shareOfRewards > 0) {
-        this.current_asa_reward_index.value = new UintN64(this.current_asa_reward_index.value.native - shareOfRewards);
-
-        if (this.staked_asset_id.value === this.reward_asset_id.value) {
-          //Compound rewards into stake if same asset
-          this.stakers(op.Txn.sender).value = new StakeInfoRecord({
-            stake: new UintN64(currentRecord.stake.native + shareOfRewards),
-            lastRewardIndex: this.current_asa_reward_index.value,
-          }).copy();
-          this.total_staked.value = new UintN64(this.total_staked.value.native + shareOfRewards);
-        } else {
-          itxn
-            .assetTransfer({
-              xferAsset: this.reward_asset_id.value.native,
-              assetReceiver: op.Txn.sender,
-              sender: Global.currentApplicationAddress,
-              assetAmount: shareOfRewards,
-              fee: STANDARD_TXN_FEE,
-            })
-            .submit();
-        }
-      }
+    if (pending > 0) {
+      // Always pay out rewards on unstake (even if same asset) for clarity
+      itxn
+        .assetTransfer({
+          xferAsset: this.reward_asset_id.value.native,
+          assetReceiver: op.Txn.sender,
+          sender: Global.currentApplicationAddress,
+          assetAmount: pending,
+          fee: STANDARD_TXN_FEE,
+        })
+        .submit();
     }
 
-    const updatedRecord = this.stakers(op.Txn.sender).value.copy();
+    // 3) Return staked tokens
     itxn
       .assetTransfer({
         xferAsset: this.staked_asset_id.value.native,
         assetReceiver: op.Txn.sender,
         sender: Global.currentApplicationAddress,
-        assetAmount: quantity === 0 ? updatedRecord.stake.native : quantity,
+        assetAmount: amountToWithdraw,
         fee: STANDARD_TXN_FEE,
       })
       .submit();
 
-    // Update the total staked value
-    // Not using the stakeToRemove vairable here, as totalStake wont have been updated from compounded rewards.
-    this.total_staked.value = new UintN64(this.total_staked.value.native - (quantity === 0 ? updatedRecord.stake.native : quantity));
-    if (quantity === 0) {
+    // 4) Update pool total
+    this.total_staked.value = new UintN64(this.total_staked.value.native - amountToWithdraw);
+
+    // 5) Update (or delete) user record
+    const remaining: uint64 = stakeNow - amountToWithdraw;
+    if (remaining === 0) {
+      // Full exit
       this.stakers(op.Txn.sender).delete();
       this.num_stakers.value = new UintN64(this.num_stakers.value.native - 1);
+      //Repay unlocked MBR from box
+      itxn
+        .payment({
+          receiver: op.Txn.sender,
+          amount: BOX_FEE - 2000,
+          sender: Global.currentApplicationAddress,
+          fee: STANDARD_TXN_FEE,
+        })
+        .submit();
     } else {
+      // Partial exit: refresh rewardDebt to new checkpoint
+      const newDebt = mulDivW(remaining, this.reward_per_token.value.native, PRECISION);
       this.stakers(op.Txn.sender).value = new StakeInfoRecord({
-        stake: new UintN64(updatedRecord.stake.native - quantity),
-        lastRewardIndex: this.current_asa_reward_index.value,
+        stake: new UintN64(remaining),
+        rewardDebt: new UintN64(newDebt),
       }).copy();
     }
   }
