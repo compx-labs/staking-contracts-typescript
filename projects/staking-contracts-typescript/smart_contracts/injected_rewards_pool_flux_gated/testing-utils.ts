@@ -1,5 +1,5 @@
-import { TransactionSignerAccount } from '@algorandfoundation/algokit-utils/types/account';
-import algosdk from 'algosdk';
+import { TransactionSignerAccount } from "@algorandfoundation/algokit-utils/types/account";
+import algosdk from "algosdk";
 
 export interface StakingAccount {
   account?: TransactionSignerAccount;
@@ -21,6 +21,11 @@ export function byteArrayToUint128(byteArray: Uint8Array): bigint {
   }
 
   return result;
+}
+
+export function mulDivFloor(a: bigint, b: bigint, c: bigint): bigint {
+  if (c === 0n) throw new Error("mulDivFloor: division by zero");
+  return (a * b) / c; // BigInt floors by default
 }
 
 export function getByteArrayValuesAsBigInts(byteArray: Uint8Array, byteLength: number): bigint[] {

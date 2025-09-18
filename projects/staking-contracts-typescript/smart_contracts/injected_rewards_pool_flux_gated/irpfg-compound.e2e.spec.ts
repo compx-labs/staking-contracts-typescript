@@ -4,7 +4,7 @@ import * as algokit from "@algorandfoundation/algokit-utils";
 
 import { IrpfgClient } from "../artifacts/injected_rewards_pool_flux_gated/irpfgClient";
 import { Account } from "algosdk";
-import { getStakingAccount, StakingAccount } from "./testing-utils";
+import { getStakingAccount, mulDivFloor, StakingAccount } from "./testing-utils";
 import { AlgoAmount } from "@algorandfoundation/algokit-utils/types/amount";
 import { deploy, getFluxGateClient } from "./deploy";
 import { FluxGateClient } from "./flux-gateClient";
@@ -18,6 +18,8 @@ let admin: Account;
 let stakeAndRewardAssetId: bigint;
 let ASAInjectionAmount = 10n * 10n ** 6n;
 const BYTE_LENGTH_STAKER = 48;
+export const PRECISION = 1_000_000_000_000_000n;
+
 const BOX_FEE = 22_500n;
 const numStakers = 10n;
 let stakingAccounts: StakingAccount[] = [];
@@ -69,6 +71,26 @@ describe("Injected Reward Pool - 50x stakers test", () => {
     expect(globalState.stakedAssetId).toBe(stakeAndRewardAssetId);
     expect(globalState.rewardAssetId).toBe(stakeAndRewardAssetId);
     expect(globalState.lastRewardInjectionTime).toBe(0n);
+  });
+
+  test("inject rewards ASA with no stake - expect fail ", async () => {
+    const { algorand } = fixture;
+
+    const axferTxn = await algorand.createTransaction.assetTransfer({
+      sender: admin.addr,
+      receiver: appClient.appAddress,
+      assetId: stakeAndRewardAssetId,
+      amount: ASAInjectionAmount,
+    });
+
+    appClient.algorand.setSignerFromAccount(admin);
+    await expect(
+      appClient.send.injectRewards({
+        args: [axferTxn, ASAInjectionAmount, stakeAndRewardAssetId],
+        assetReferences: [stakeAndRewardAssetId],
+        populateAppCallResources: true,
+      })
+    ).rejects.toThrow();
   });
 
   test("init stakers", async () => {
@@ -160,7 +182,7 @@ describe("Injected Reward Pool - 50x stakers test", () => {
   test("inject rewards ASA ", async () => {
     const { algorand } = fixture;
     const globalStateBefore = await appClient.state.global.getAll();
-    const previousAsaRewardIndex = globalStateBefore.currentAsaRewardIndex as bigint;
+    const previousRewardPerToken = globalStateBefore.rewardPerToken as bigint;
 
     const axferTxn = await algorand.createTransaction.assetTransfer({
       sender: admin.addr,
@@ -177,7 +199,10 @@ describe("Injected Reward Pool - 50x stakers test", () => {
     });
 
     const globalStateAfter = await appClient.state.global.getAll();
-    expect(globalStateAfter.currentAsaRewardIndex).toBe(previousAsaRewardIndex + ASAInjectionAmount);
+    const totalStakeAfter = globalStateAfter.totalStaked as bigint;
+    const deltaRPT = (ASAInjectionAmount * PRECISION) / totalStakeAfter;
+    const newRewardPerToken = previousRewardPerToken + deltaRPT;
+    expect(globalStateAfter.rewardPerToken).toBe(newRewardPerToken);
   });
 
   test.skip("attempt to unstake more than staked", async () => {
@@ -193,52 +218,90 @@ describe("Injected Reward Pool - 50x stakers test", () => {
   }, 60000);
 
   test("unstake all", async () => {
-    for (var i = 0; i < numStakers; i++) {
+    // read global ids once
+    const gs = await appClient.state.global.getAll();
+    const stakedAssetId = gs.stakedAssetId as bigint;
+    const rewardAssetId = gs.rewardAssetId as bigint;
+    const sameAsset = stakedAssetId === rewardAssetId;
+
+    for (let i = 0; i < numStakers; i++) {
       const staker = stakingAccounts[i];
-      console.log("Unstaking for staker:", i, " address:", staker.account!.addr);
       appClient.algorand.setSignerFromAccount(staker.account!);
 
-      const assetBalanceBeforeRequest = await appClient.algorand.client.algod
-        .accountAssetInformation(staker.account!.addr, stakeAndRewardAssetId)
+      // --- balances before ---
+      const stakeBalBeforeReq = await appClient.algorand.client.algod
+        .accountAssetInformation(staker.account!.addr, Number(stakedAssetId))
         .do();
-      const assetBalanceBefore = assetBalanceBeforeRequest.assetHolding?.amount ?? 0n;
-      console.log("assetBalanceBefore:", assetBalanceBefore);
+      const stakeBalBefore = BigInt(stakeBalBeforeReq.assetHolding?.amount ?? 0);
 
-      // Get stake and reward diffs prior to unstaking
+      let rewardBalBefore = 0n;
+      if (!sameAsset) {
+        const rewardBalBeforeReq = await appClient.algorand.client.algod
+          .accountAssetInformation(staker.account!.addr, Number(rewardAssetId))
+          .do();
+        rewardBalBefore = BigInt(rewardBalBeforeReq.assetHolding?.amount ?? 0);
+      }
+
+      // --- staker state before ---
       const stakerMap = await appClient.state.box.stakers.getMap();
-      const stakeInfoBefore = stakerMap.get(staker.account!.addr.toString());
-      console.log("staker info before unstaking:", stakeInfoBefore);
-      expect(stakeInfoBefore).toBeDefined();
-      const stakeBefore = stakeInfoBefore?.stake ?? 0n;
+      const recBefore = stakerMap.get(staker.account!.addr.toString());
+      expect(recBefore).toBeDefined();
+      const stakeBefore = BigInt(recBefore?.stake ?? 0n);
+      const rewardDebtBefore = BigInt(recBefore?.rewardDebt ?? 0n);
       expect(stakeBefore).toBeGreaterThan(0n);
-      const lastRewardIndexBefore = stakeInfoBefore?.lastRewardIndex ?? 0n;
-      expect(lastRewardIndexBefore).toBeDefined();
-      const globalStateBefore = await appClient.state.global.getAll();
-      const currentAsaRewardIndexBefore = globalStateBefore.currentAsaRewardIndex as bigint;
-      expect(currentAsaRewardIndexBefore).toBeGreaterThan(0n);
-      const stakeIndex = Number(numStakers) - i // stake index is reverse order to staker index
-      const rewardDiff = (Number(currentAsaRewardIndexBefore) - Number(lastRewardIndexBefore)) / stakeIndex;
 
+      // --- global accumulator ---
+      const gs2 = await appClient.state.global.getAll();
+      const rewardPerToken = BigInt(gs2.rewardPerToken as bigint);
+      expect(rewardPerToken).toBeGreaterThanOrEqual(0n);
+
+      // --- expected pending by monotonic model ---
+      const accrued = mulDivFloor(stakeBefore, rewardPerToken, PRECISION);
+      const pending = accrued > rewardDebtBefore ? accrued - rewardDebtBefore : 0n;
+
+      // --- perform unstake all (quantity = 0) ---
       const max_fee = 250_000;
       await appClient
         .newGroup()
         .unstake({ args: [0], sender: staker.account!.addr, maxFee: AlgoAmount.MicroAlgos(max_fee) })
         .send({ populateAppCallResources: true, suppressLog: false, coverAppCallInnerTransactionFees: true });
 
-      const assetBalanceAfterRequest = await appClient.algorand.client.algod
-        .accountAssetInformation(staker.account!.addr, stakeAndRewardAssetId)
+      // --- balances after ---
+      const stakeBalAfterReq = await appClient.algorand.client.algod
+        .accountAssetInformation(staker.account!.addr, Number(stakedAssetId))
         .do();
-      const assetBalanceAfter = assetBalanceAfterRequest.assetHolding?.amount ?? 0n;
+      const stakeBalAfter = BigInt(stakeBalAfterReq.assetHolding?.amount ?? 0);
 
-      expect(assetBalanceAfter).toBeGreaterThan(assetBalanceBefore);
-      expect(assetBalanceAfter).toBeLessThanOrEqual(stakeBefore + assetBalanceBefore + BigInt(Math.floor(rewardDiff)));
-      console.log("Unstaking complete - total unstaked (stake + rewards):", stakeBefore + assetBalanceBefore + BigInt(Math.floor(rewardDiff)));
-      // Get stake and reward diffs prior to unstaking
+      let rewardBalAfter = 0n;
+      if (!sameAsset) {
+        const rewardBalAfterReq = await appClient.algorand.client.algod
+          .accountAssetInformation(staker.account!.addr, Number(rewardAssetId))
+          .do();
+        rewardBalAfter = BigInt(rewardBalAfterReq.assetHolding?.amount ?? 0);
+      }
+
+      // --- assertions ---
+      if (sameAsset) {
+        // User receives stake + pending in the same ASA
+        const deltaStakeAsset = stakeBalAfter - stakeBalBefore;
+        expect(deltaStakeAsset).toBeGreaterThanOrEqual(stakeBefore); // got at least the principal back
+        expect(deltaStakeAsset).toBe(stakeBefore + pending); // exactly principal + pending
+      } else {
+        // Stake asset increases by stake; reward asset increases by pending
+        const deltaStakeAsset = stakeBalAfter - stakeBalBefore;
+        const deltaRewardAsset = rewardBalAfter - rewardBalBefore;
+
+        expect(deltaStakeAsset).toBe(stakeBefore);
+        // pending can be zero in edge cases; just assert non-negative and exact match
+        expect(deltaRewardAsset).toBe(pending);
+      }
+
+      // Staker box should be removed after full exit
       const stakerMapAfter = await appClient.state.box.stakers.getMap();
-      const stakeInfoAfter = stakerMapAfter.get(staker.account!.addr.toString());
-      expect(stakeInfoAfter).toBeUndefined();
+      const recAfter = stakerMapAfter.get(staker.account!.addr.toString());
+      expect(recAfter).toBeUndefined();
     }
-  }, 60000);
+  }, 60_000);
 
   test.skip("deleteApplication", async () => {
     appClient.algorand.setSignerFromAccount(admin);
